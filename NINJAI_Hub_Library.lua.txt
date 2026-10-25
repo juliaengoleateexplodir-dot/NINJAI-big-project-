@@ -1,0 +1,1244 @@
+--[[
+  NINJ AI · Hub administrativo em UI Library
+  ---------------------------------------------------------------
+  COMO USAR
+  1) Execute primeiro o NINJ_AI_tudo_em_1_v3.lua (o motor e a rede neural).
+  2) Coloque o link da SUA library na variável LIBRARY_URL logo abaixo.
+  3) Execute este arquivo.
+
+  A library não é modificada: tudo o que ela não tem (visão 3D, caixas de texto, relatórios longos)
+  este script desenha por conta própria em janelinhas escuras.
+]]
+
+--// ⚠⚠⚠  COLOQUE AQUI O LINK (raw) DA SUA UI LIBRARY  ⚠⚠⚠
+--// Exemplo: "https://raw.githubusercontent.com/SEU_USUARIO/SEU_REPOSITORIO/main/library.lua"
+local LIBRARY_URL = ""
+
+local HIDE_BUILTIN_HUB = true -- esconde o painel próprio do v3 (botão ◈) para não ter dois painéis
+local HUB_NAME = "NINJ AI Hub"
+local HUB_VERSION = "v1.0"
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+if type(LIBRARY_URL) ~= "string" or LIBRARY_URL == "" or LIBRARY_URL:find("COLOQUE", 1, true) then
+	error("[NINJAI Hub] Falta o link da library. Abra este arquivo e preencha a variável LIBRARY_URL (no começo do arquivo) com o link raw da sua library.", 0)
+end
+
+local API = shared.NinjAI
+if type(API) ~= "table" or type(API.Modules) ~= "table" or not API.Modules.NinjaNN or not API.Modules.AdminHub then
+	error("[NINJAI Hub] Execute o NINJ_AI_tudo_em_1_v3.lua antes deste arquivo (ele cria a rede neural e o motor).", 0)
+end
+
+local okLib, Library = pcall(function()
+	local src = game:HttpGet(LIBRARY_URL)
+	local chunk, compileErr = loadstring(src)
+	if type(chunk) ~= "function" then error("a library não compilou: " .. tostring(compileErr), 0) end
+	local lib = chunk()
+	if type(lib) ~= "table" then error("o arquivo da library não retornou uma tabela", 0) end
+	return lib
+end)
+if not okLib then error("[NINJAI Hub] não consegui carregar a library: " .. tostring(Library), 0) end
+
+--==============================================================================
+-- atalhos para o motor
+--==============================================================================
+local M = API.Modules
+local NN, HUB, Main, Config = M.NinjaNN, M.AdminHub, M.Main, API.Config
+local Network, AM, NM, Training, Evo = NN.Network, NN.ArchitectureManager, NN.NeuronManager, NN.Training, NN.Evolution
+local KS, PR, FS, MC = NN.KnowledgeStore, NN.PatternRecognizer, NN.FeedbackSystem, NN.ModelCheckpoint
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+
+local function trim(s) return (tostring(s):match("^%s*(.-)%s*$")) end
+local function pct(x) return string.format("%.0f%%", (x or 0) * 100) end
+local function clip(s, n) s = tostring(s):gsub("%s+", " "); if #s > n then return s:sub(1, n - 1) .. "…" end return s end
+local function fmtTime(t) return os.date("%H:%M:%S", t) end
+local function row(text, value) return { Text = tostring(text), Value = tostring(value) } end
+local function meta() return NN.VersionMeta(NN.ActiveVersion) end
+local function copy(text)
+	local fn = rawget(_G, "setclipboard") or rawget(_G, "toclipboard") or (getgenv and getgenv().setclipboard)
+	if type(fn) == "function" then local ok = pcall(fn, text); return ok end
+	return false
+end
+local function stateText()
+	local R = NN.Run
+	if R.running then return R.paused and "em pausa" or string.format("treinando (%s) época %d/%d", R.kind, R.epoch, R.total) end
+	return "ocioso"
+end
+
+--==============================================================================
+-- janela principal
+--==============================================================================
+Library:SetDefaultTheme("Midnight")
+
+local Window = Library:CreateWindow({
+	Name = HUB_NAME,
+	LoadingSubtitle = HUB_VERSION,
+	ToggleUIKeybind = "RightControl",
+	ConfigurationSaving = { Enabled = false, FolderName = "NinjAIHub", FileName = "default" },
+	ToggleButton = { Platform = "Mobile" },
+})
+
+local function notify(text, ok)
+	pcall(function()
+		Library:Notify({ Title = NN.Settings.name, Content = tostring(text), Type = ok and "Success" or "Info", Duration = 4 })
+	end)
+end
+
+-- executa uma ação com permissão, auditoria (mesmo registro do Hub) e aviso do resultado
+local function act(label, level, fn, bypass)
+	return function()
+		if not HUB.Can(level) then
+			notify("✖ Sem permissão para \"" .. label .. "\" (precisa de " .. level .. "; você está como " .. HUB.role .. ")")
+			return
+		end
+		if level == "admin" and not bypass and HUB.Auth.protect and HUB.Auth.admin and (HUB.editUntil or 0) < os.time() then
+			notify("Configurações protegidas: libere as edições na aba Segurança (PIN)")
+			return
+		end
+		if level ~= "viewer" then NN.Log("admin", label .. " [" .. HUB.role .. "]") end
+		local ok, a, b = pcall(fn)
+		if not ok then
+			NN.Fail("hubui:" .. label, a)
+			notify("✖ Erro: " .. clip(a, 140))
+		elseif a == false then
+			notify("⚠ " .. clip(b or "não foi possível", 160))
+		elseif type(a) == "string" then
+			notify("✔ " .. clip(a, 160), true)
+		elseif type(b) == "string" then
+			notify("✔ " .. clip(b, 160), true)
+		else
+			notify("✔ " .. label, true)
+		end
+	end
+end
+
+--==============================================================================
+-- caixas próprias: texto, perguntas e visão 3D (a library não tem)
+--==============================================================================
+local C = {
+	bg = Color3.fromRGB(14, 14, 16), card = Color3.fromRGB(24, 24, 28), field = Color3.fromRGB(32, 32, 38), line = Color3.fromRGB(46, 46, 54),
+	text = Color3.fromRGB(235, 235, 240), dim = Color3.fromRGB(145, 145, 155), accent = Color3.fromRGB(122, 92, 255),
+}
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+local function corner(o, r) new("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o) end
+local function guiRoot()
+	local ok, hui = pcall(function() return gethui() end)
+	if ok and typeof(hui) == "Instance" then return hui end
+	return Players.LocalPlayer:WaitForChild("PlayerGui")
+end
+local overlay = new("ScreenGui", { Name = "NinjAIHubJanelas", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 200, IgnoreGuiInset = true }, guiRoot())
+
+local function button(parent, label, fn, color)
+	local b = new("TextButton", { Text = label, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = C.text, BackgroundColor3 = color or C.field,
+		Size = UDim2.new(0, 0, 0, 28), AutomaticSize = Enum.AutomaticSize.X, AutoButtonColor = true }, parent)
+	corner(b, 6)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, b)
+	b.Activated:Connect(fn)
+	return b
+end
+
+local function windowFrame(title, wScale, hScale)
+	local f = new("Frame", { BackgroundColor3 = C.bg, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(wScale, 0, hScale, 0), Active = true }, overlay)
+	corner(f, 12)
+	new("UIStroke", { Color = C.line, Thickness = 1 }, f)
+	new("UISizeConstraint", { MaxSize = Vector2.new(760, 560), MinSize = Vector2.new(260, 200) }, f)
+	new("TextLabel", { Text = title, Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = C.text, BackgroundTransparency = 1, Size = UDim2.new(1, -20, 0, 32),
+		Position = UDim2.new(0, 12, 0, 0), TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, f)
+	return f
+end
+
+local current = {}
+local function closeKind(kind) if current[kind] then pcall(function() current[kind]:Destroy() end); current[kind] = nil end end
+
+-- texto longo com rolagem e botão de copiar
+local function showText(title, text)
+	closeKind("text")
+	local f = windowFrame(title, 0.9, 0.78)
+	current.text = f
+	local scroll = new("ScrollingFrame", { BackgroundColor3 = C.card, BorderSizePixel = 0, Size = UDim2.new(1, -24, 1, -86), Position = UDim2.new(0, 12, 0, 36),
+		CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 4 }, f)
+	corner(scroll, 8)
+	new("TextLabel", { Text = tostring(text):sub(1, 20000), Font = Enum.Font.Code, TextSize = 12, TextColor3 = C.text, BackgroundTransparency = 1, TextWrapped = true,
+		Size = UDim2.new(1, -16, 0, 0), Position = UDim2.new(0, 8, 0, 8), AutomaticSize = Enum.AutomaticSize.Y, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top }, scroll)
+	local bar = new("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -24, 0, 30), Position = UDim2.new(0, 12, 1, -40) }, f)
+	new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8) }, bar)
+	button(bar, "Copiar", function() notify(copy(tostring(text)) and "Texto copiado" or "Este executor não tem setclipboard", true) end)
+	button(bar, "Fechar", function() closeKind("text") end, C.accent)
+end
+
+-- pergunta com caixa de texto (uma linha ou várias); chama cb(texto) ao confirmar
+local function ask(title, placeholder, default, multiline, cb)
+	closeKind("ask")
+	local f = windowFrame(title, 0.9, multiline and 0.6 or 0.3)
+	current.ask = f
+	local box = new("TextBox", { PlaceholderText = placeholder or "", Text = default or "", ClearTextOnFocus = false, MultiLine = multiline and true or false, TextWrapped = multiline and true or false,
+		Font = multiline and Enum.Font.Code or Enum.Font.Gotham, TextSize = 13, TextColor3 = C.text, PlaceholderColor3 = C.dim, BackgroundColor3 = C.field,
+		Size = UDim2.new(1, -24, 1, -90), Position = UDim2.new(0, 12, 0, 38), TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = multiline and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center,
+		ClipsDescendants = true }, f)
+	corner(box, 8)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 6) }, box)
+	local bar = new("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -24, 0, 30), Position = UDim2.new(0, 12, 1, -40) }, f)
+	new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 8) }, bar)
+	local function submit()
+		local t = box.Text
+		closeKind("ask")
+		local ok, err = pcall(cb, t)
+		if not ok then NN.Fail("hubui:ask", err); notify("✖ Erro: " .. clip(err, 140)) end
+	end
+	button(bar, "OK", submit, C.accent)
+	button(bar, "Cancelar", function() closeKind("ask") end)
+	if not multiline then box.FocusLost:Connect(function(enter) if enter then submit() end end) end
+	return box
+end
+
+-- botão que pergunta antes de agir: permissão primeiro, depois a caixa, depois a ação
+local function askAction(label, level, title, placeholder, default, multiline, handler)
+	return function()
+		if not HUB.Can(level) then
+			notify("✖ Sem permissão para \"" .. label .. "\" (precisa de " .. level .. "; você está como " .. HUB.role .. ")")
+			return
+		end
+		ask(title, placeholder, default, multiline, function(text)
+			act(label, level, function() return handler(text) end)()
+		end)
+	end
+end
+
+-- visão 3D (rede, módulos ou conhecimento) usando a cena do Hub do motor
+local function view3D(kind)
+	closeKind("view")
+	local titles = { rede = "Rede neural em 3D", modulos = "Módulos em 3D", conhecimento = "Conhecimento em 3D" }
+	local f = windowFrame(titles[kind] or "3D", 0.95, 0.88)
+	current.view = f
+	local holder = new("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -24, 1, -118), Position = UDim2.new(0, 12, 0, 36) }, f)
+	local V = HUB.MakeView(holder, 300, 1)
+	V.vp.Size = UDim2.new(1, 0, 1, 0)
+	local legend = new("TextLabel", { Text = "", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = C.dim, BackgroundTransparency = 1, TextWrapped = true,
+		Size = UDim2.new(1, -24, 0, 36), Position = UDim2.new(0, 12, 1, -80), TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top }, f)
+	local mode = "pesos"
+	local function redraw()
+		local ok, text
+		if kind == "rede" then ok, text = pcall(HUB.SceneNetwork, V, mode)
+		elseif kind == "modulos" then ok, text = pcall(HUB.SceneModules, V)
+		else ok, text = pcall(HUB.SceneKnowledge, V) end
+		legend.Text = ok and tostring(text) or ("erro: " .. tostring(text))
+	end
+	redraw()
+	local bar = new("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -24, 0, 30), Position = UDim2.new(0, 12, 1, -40) }, f)
+	new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), Wraps = true }, bar)
+	button(bar, "Zoom +", function() V.Zoom(0.8) end)
+	button(bar, "Zoom −", function() V.Zoom(1.25) end)
+	button(bar, "Girar", function() V.spin = not V.spin end)
+	button(bar, "Atualizar", redraw)
+	if kind == "rede" then
+		button(bar, "Pesos/Fluxo", function() mode = (mode == "pesos") and "fluxo" or "pesos"; redraw() end)
+		button(bar, "Testar frase", function()
+			ask("Testar frase na rede", "ex.: criar um script de pulo duplo", "", false, function(t)
+				local r = NN.Predict(t)
+				if not r then notify("Sem rede treinada"); return end
+				local p = {}
+				for _, x in ipairs(r.top) do p[#p + 1] = x.label .. " " .. pct(x.prob) end
+				notify("Previsão: " .. table.concat(p, " · "), true)
+				redraw()
+			end)
+		end)
+	end
+	button(bar, "Fechar", function() closeKind("view") end, C.accent)
+end
+
+--==============================================================================
+-- estado compartilhado dos controles
+--==============================================================================
+local ready = false
+local S = { layer = 2, n = 8, thr = 0.02, act = "tanh", wl = 2, wj = 1, wi = 1, pnum = 1,
+	lr = NN.Settings.lr, batch = NN.Settings.batch, epochs = NN.Settings.epochs, loss = NN.Settings.loss }
+local function pick(opt) return type(opt) == "table" and opt[1] or opt end
+
+local function silentAdmin(fn)
+	return function(v)
+		if not ready or not HUB.Can("admin") then return end
+		if HUB.Auth.protect and HUB.Auth.admin and (HUB.editUntil or 0) < os.time() then return end
+		pcall(fn, v)
+		NN.Touch()
+	end
+end
+local function toggleAct(label, fn)
+	return function(v)
+		if not ready then return end
+		act(label, "admin", function() fn(v); NN.Touch(); return label .. ": " .. (v and "ligado" or "desligado") end)()
+	end
+end
+
+local function btn(group, name, icon, level, fn)
+	return group:CreateButton({ Name = name, Icon = icon, Callback = act(name, level, fn) })
+end
+local function btnAsk(group, name, icon, level, title, placeholder, default, multiline, handler)
+	return group:CreateButton({ Name = name, Icon = icon, Callback = askAction(name, level, title, placeholder, default, multiline, handler) })
+end
+
+-- muda a rede numa cópia, valida, cria ponto de restauração e só então troca (igual ao Hub próprio)
+local function commitArch(label, mutate)
+	local base = NN.Net
+	if not base then return false, "não há rede ativa" end
+	local clone = Network.Clone(base)
+	local ok, msg = mutate(clone)
+	if not ok then return false, msg or "não foi possível" end
+	local good, probs = AM.Validate(clone, #clone.labels)
+	if not good then return false, "ficaria inválida: " .. tostring(probs[1]) end
+	MC.Point("antes: " .. label)
+	local data, sum = NN.LastData, { epochs = 0, samples = 0, loss = 0, trainAcc = 0, valAcc = 0 }
+	if data then
+		local _, ta = Training.Evaluate(clone, data.train)
+		local vl, va = Training.Evaluate(clone, #data.val > 0 and data.val or data.train)
+		sum = { epochs = 0, samples = #data.train, loss = vl, valLoss = vl, trainAcc = ta, valAcc = va }
+	end
+	local prevMeta = meta()
+	local approved, txt = NN.Adopt(clone, sum, { kind = "manual", force = true, data = data, note = label })
+	if not approved then return false, txt end
+	local dropped = prevMeta and sum.valAcc < prevMeta.valAcc - 0.05
+	if dropped and NN.Settings.autoLearn and not NN.Run.running then
+		NN.StartTraining({})
+		return true, label .. " — a precisão caiu, retreinando automaticamente"
+	end
+	return true, label .. (msg and (" — " .. tostring(msg)) or "") .. (dropped and " (retreine para recuperar a precisão)" or "")
+end
+
+local function logRows(kinds, n)
+	local out, A = {}, NN.Activity
+	for i = #A, 1, -1 do
+		if #out >= n then break end
+		local a = A[i]
+		if not kinds or kinds[a.kind] then out[#out + 1] = row(fmtTime(a.t) .. " · " .. a.kind, clip(a.msg, 90)) end
+	end
+	if #out == 0 then out[1] = row("—", "nada ainda") end
+	return out
+end
+
+--==============================================================================
+-- 1. Visão Geral
+--==============================================================================
+local T = Window:CreateTab({ Name = "Visão Geral", Icon = "layout-dashboard" })
+local g = T:AddLeftGroupbox({ Name = "Estado da IA", Icon = "activity" })
+g:CreateStatusList({ Name = "Resumo", MaxRows = 9, UpdateRate = 1, Update = function()
+	local c = NN.Net and Network.Counts(NN.Net)
+	local m = meta()
+	return {
+		row("IA", NN.Settings.name .. " · motor " .. tostring(API.Version) .. " · rede " .. NN.Version),
+		row("Estado", stateText()),
+		row("Rede", NN.Summary()),
+		row("Parâmetros", c and c.params or "—"),
+		row("Neurônios · camadas", c and (c.neurons .. " · " .. c.layers) or "—"),
+		row("Conexões", c and c.connections or "—"),
+		row("Validação", m and pct(m.valAcc) or "—"),
+		row("Memória Lua", string.format("%.0f KB", collectgarbage("count"))),
+		row("Salvamento", NN.Dirty and "alterações não salvas" or "tudo salvo"),
+	}
+end })
+g:CreateStatusList({ Name = "Aprendizado", MaxRows = 4, UpdateRate = 2, Update = function()
+	return {
+		row("👍 / 👎", FS.Total.up .. " / " .. FS.Total.down),
+		row("Exemplos de feedback", #FS.Examples),
+		row("Novos desde o último treino", NN.Pending .. " (auto-treino a cada " .. NN.Settings.autoLearnEvery .. ")"),
+		row("Seu nível no Hub", HUB.role),
+	}
+end })
+local g2 = T:AddRightGroupbox({ Name = "Aprendizados recentes", Icon = "brain" })
+g2:CreateStatusList({ Name = "Últimos", MaxRows = 6, UpdateRate = 2, Update = function()
+	return logRows({ treino = true, versao = true, feedback = true, conhecimento = true, expansao = true, rejeitada = true }, 6)
+end })
+local g3 = T:AddRightGroupbox({ Name = "Erros e alertas", Icon = "triangle-alert" })
+g3:CreateStatusList({ Name = "Alertas", MaxRows = 6, UpdateRate = 2, Update = function()
+	local r = {}
+	if not NN.Net then r[#r + 1] = row("⚠", "rede ainda sem treino") end
+	if not M.ExecutorAdapter.Caps.files then r[#r + 1] = row("⚠", "sem writefile: nada é salvo em disco") end
+	for i = #NN.Errors, math.max(1, #NN.Errors - 3), -1 do r[#r + 1] = row("✖ " .. NN.Errors[i].where, clip(NN.Errors[i].err, 80)) end
+	if #r == 0 then r[1] = row("✔", "nenhum erro ou alerta") end
+	return r
+end })
+g3:CreateStatusList({ Name = "Ações administrativas", MaxRows = 5, UpdateRate = 2, Update = function() return logRows({ admin = true }, 5) end })
+
+--==============================================================================
+-- 2. Rede Neural
+--==============================================================================
+T = Window:CreateTab({ Name = "Rede Neural", Icon = "brain-circuit" })
+g = T:AddLeftGroupbox({ Name = "Visualização", Icon = "box" })
+btn(g, "Abrir visão 3D da rede", "box", "viewer", function() view3D("rede") end)
+btnAsk(g, "Testar frase na rede", "search", "viewer", "Testar frase na rede", "ex.: criar um script de pulo duplo", "", false, function(t)
+	local r = NN.Predict(t)
+	if not r then return false, "sem rede treinada" end
+	local p = {}
+	for _, x in ipairs(r.top) do p[#p + 1] = x.label .. " " .. pct(x.prob) end
+	return "Previsão: " .. table.concat(p, " · ")
+end)
+g:CreateStatusList({ Name = "Estrutura (camada 1 = entrada)", MaxRows = 10, UpdateRate = 2, Update = function()
+	local n, r = NN.Net, {}
+	if not n then return { row("—", "sem rede treinada") } end
+	for l = 1, math.min(#n.sizes, 8) do
+		local role = (l == 1) and "entrada" or ((l == #n.sizes) and "saída" or "oculta")
+		r[#r + 1] = row("Camada " .. l .. " · " .. role, n.sizes[l] .. " neurônios · " .. tostring(n.acts[l]))
+	end
+	local c = Network.Counts(n)
+	r[#r + 1] = row("Total", c.params .. " parâmetros · " .. c.connections .. " conexões")
+	return r
+end })
+
+g2 = T:AddRightGroupbox({ Name = "Arquitetura", Icon = "blocks" })
+g2:CreateSlider({ Name = "Camada alvo", Range = { 1, 8 }, Increment = 1, CurrentValue = 2, Flag = "nn_layer", Callback = function(v) S.layer = math.floor(v) end })
+g2:CreateSlider({ Name = "Quantidade / tamanho", Range = { 1, 64 }, Increment = 1, CurrentValue = 8, Flag = "nn_n", Callback = function(v) S.n = math.floor(v) end })
+g2:CreateSlider({ Name = "Limiar de poda", Range = { 0.005, 0.2 }, Increment = 0.005, CurrentValue = 0.02, Flag = "nn_thr", Callback = function(v) S.thr = v end })
+g2:CreateDropdown({ Name = "Ativação", Options = { "tanh", "sigmoid", "relu", "leaky", "linear", "softmax" }, CurrentOption = "tanh", AllowNone = false, Flag = "nn_act", Callback = function(o) S.act = pick(o) end })
+btn(g2, "Adicionar camada", "layers-plus", "admin", function()
+	local l, n, a = S.layer, S.n, S.act
+	return commitArch("camada nova na posição " .. l, function(net) return AM.AddLayer(net, l, n, a) end)
+end)
+btn(g2, "Remover camada", "trash-2", "admin", function()
+	local l = S.layer
+	return commitArch("camada " .. l .. " removida", function(net) return AM.RemoveLayer(net, l) end)
+end)
+btn(g2, "+ neurônios", "plus", "admin", function()
+	local l, n = S.layer, S.n
+	return commitArch("+" .. n .. " neurônios na camada " .. l, function(net) return NM.AddNeurons(net, l, n) end)
+end)
+btn(g2, "− neurônios", "minus", "admin", function()
+	local l, n = S.layer, S.n
+	return commitArch("−" .. n .. " neurônios na camada " .. l, function(net)
+		if not net.W[l] then return false, "camada inválida" end
+		local list = {}
+		for j = net.sizes[l], math.max(1, net.sizes[l] - n + 1), -1 do list[#list + 1] = j end
+		return NM.RemoveNeurons(net, l, list)
+	end)
+end)
+btn(g2, "Mudar ativação da camada", "zap", "admin", function()
+	local l, a = S.layer, S.act
+	return commitArch("ativação da camada " .. l .. " = " .. a, function(net) return AM.SetActivation(net, l, a) end)
+end)
+btn(g2, "Podar conexões fracas", "scissors", "admin", function()
+	local thr = S.thr
+	return commitArch("poda |peso| < " .. thr, function(net) local c = AM.PruneConnections(net, thr); return c > 0, c .. " conexões desligadas" end)
+end)
+btn(g2, "Validar arquitetura", "shield-check", "viewer", function()
+	if not NN.Net then return false, "sem rede" end
+	local ok, p = AM.Validate(NN.Net, #NN.Net.labels)
+	if ok then return "Arquitetura válida" end
+	showText("Arquitetura inválida", table.concat(p, "\n"))
+	return false, "arquitetura com problemas (veja a janela)"
+end)
+btn(g2, "Comparar com versão anterior", "git-compare", "viewer", function()
+	if not NN.Net then return false, "sem rede" end
+	local other, label
+	if NN.Experimental then other, label = NN.Experimental.net, "ativa → experimental"
+	else
+		local best
+		for id in pairs(NN.Models) do if id < (NN.ActiveVersion or 0) and (not best or id > best) then best = id end end
+		if best then other, label = NN.Models[best], "v" .. best .. " → ativa" end
+	end
+	if not other then return false, "não há outra versão para comparar" end
+	local a, b = NN.Net, other
+	if label:find("→ ativa") then a, b = other, NN.Net end
+	showText("Comparação: " .. label, table.concat(AM.Compare(a, b), "\n"))
+	return true, "comparação aberta"
+end)
+
+local g4 = T:AddLeftGroupbox({ Name = "Pesos e parâmetros", Icon = "sliders-horizontal" })
+g4:CreateSlider({ Name = "Camada", Range = { 2, 8 }, Increment = 1, CurrentValue = 2, Flag = "w_l", Callback = function(v) S.wl = math.floor(v) end })
+g4:CreateSlider({ Name = "Neurônio", Range = { 1, 128 }, Increment = 1, CurrentValue = 1, Flag = "w_j", Callback = function(v) S.wj = math.floor(v) end })
+g4:CreateSlider({ Name = "Entrada", Range = { 1, 128 }, Increment = 1, CurrentValue = 1, Flag = "w_i", Callback = function(v) S.wi = math.floor(v) end })
+btn(g4, "Inspecionar neurônio", "eye", "viewer", function()
+	local info = NN.Net and NM.Info(NN.Net, S.wl, S.wj)
+	if not info then return false, "neurônio inexistente" end
+	local t = {}
+	for _, x in ipairs(info.top) do t[#t + 1] = string.format("  ← %d: %+.4f", x.from, x.w) end
+	showText("Neurônio " .. S.wj .. " da camada " .. S.wl, string.format("bias %+.4f · %s · atividade média %s\nMaiores pesos de entrada:\n%s", info.bias, info.act,
+		info.activity and string.format("%.3f", info.activity) or "—", table.concat(t, "\n")))
+	return true, "neurônio aberto"
+end)
+btnAsk(g4, "Editar valor do peso", "pencil", "admin", "Novo valor do peso (entre -50 e 50)", "ex.: 0.25", "0", false, function(txt)
+	local v, l, j, i = tonumber(txt), S.wl, S.wj, S.wi
+	if not v or v ~= v or math.abs(v) > 50 then return false, "valor inválido" end
+	return commitArch(string.format("peso [%d][%d][%d] = %g", l, j, i, v), function(net)
+		if not (net.W[l] and net.W[l][j] and net.W[l][j][i] ~= nil) then return false, "posição inexistente" end
+		net.W[l][j][i] = v
+		return true
+	end)
+end)
+btn(g4, "Maiores pesos da camada", "arrow-up-wide-narrow", "viewer", function()
+	local n = NN.Net
+	if not n then return false, "sem rede" end
+	local arr, l0 = {}, S.wl
+	for l = 2, #n.sizes do
+		if l == l0 then
+			for j = 1, n.sizes[l] do for i = 1, #n.W[l][j] do local w = n.W[l][j][i]; if w ~= 0 then arr[#arr + 1] = { j = j, i = i, w = w } end end end
+		end
+	end
+	table.sort(arr, function(a, b) return math.abs(a.w) > math.abs(b.w) end)
+	local t = {}
+	for k = 1, math.min(20, #arr) do t[k] = string.format("[%d][%d][%d] = %+.4f", l0, arr[k].j, arr[k].i, arr[k].w) end
+	showText("Maiores pesos da camada " .. l0, table.concat(t, "\n"))
+	return true, "lista aberta"
+end)
+btn(g4, "Exportar parâmetros", "upload", "viewer", function()
+	if not NN.Net then return false, "sem rede" end
+	local ok = copy(HttpService:JSONEncode(Network.Serialize(NN.Net)))
+	return ok, ok and "parâmetros copiados" or "este executor não tem setclipboard"
+end)
+btnAsk(g4, "Importar parâmetros", "download", "admin", "Cole o JSON exportado", "{...}", "", true, function(txt)
+	local ok, d = pcall(HttpService.JSONDecode, HttpService, txt)
+	if not ok then return false, "JSON inválido" end
+	local net, err = Network.Deserialize(d)
+	if not net then return false, tostring(err) end
+	local good, probs = AM.Validate(net, #net.labels)
+	if not good then return false, "reprovada na validação: " .. tostring(probs[1]) end
+	MC.Point("antes de importar")
+	return NN.Adopt(net, { epochs = 0, samples = 0, loss = 0, trainAcc = 0, valAcc = 0 }, { kind = "importacao", force = true, note = "importado pelo Hub" })
+end)
+
+local g5 = T:AddRightGroupbox({ Name = "Treinamento", Icon = "dumbbell" })
+g5:CreateSlider({ Name = "Taxa de aprendizado", Range = { 0.005, 0.5 }, Increment = 0.005, CurrentValue = S.lr, Flag = "t_lr", Callback = function(v) S.lr = v end })
+g5:CreateSlider({ Name = "Tamanho do lote", Range = { 1, 64 }, Increment = 1, CurrentValue = math.min(64, S.batch), Flag = "t_batch", Callback = function(v) S.batch = math.floor(v) end })
+g5:CreateSlider({ Name = "Épocas", Range = { 5, 200 }, Increment = 5, CurrentValue = math.min(200, S.epochs), Flag = "t_ep", Callback = function(v) S.epochs = math.floor(v) end })
+g5:CreateDropdown({ Name = "Função de perda", Options = { "crossentropy", "mse" }, CurrentOption = S.loss, AllowNone = false, Flag = "t_loss", Callback = function(o) S.loss = pick(o) end })
+btn(g5, "Aplicar parâmetros ao motor", "check", "operator", function()
+	NN.Settings.lr, NN.Settings.batch, NN.Settings.epochs, NN.Settings.loss = S.lr, S.batch, S.epochs, S.loss
+	NN.Touch()
+	return "parâmetros de treino salvos para todo o motor"
+end)
+btn(g5, "Iniciar treino", "play", "operator", function() return NN.StartTraining({ lr = S.lr, batch = S.batch, epochs = S.epochs, loss = S.loss }) end)
+btn(g5, "Treinar do zero", "rotate-ccw", "admin", function() return NN.StartTraining({ lr = S.lr, batch = S.batch, epochs = S.epochs, loss = S.loss, scratch = true }) end)
+btn(g5, "Pausar", "pause", "operator", function() local ok = NN.Pause(); return ok, ok and "pausado" or "não há treino em andamento" end)
+btn(g5, "Retomar", "play", "operator", function() NN.Resume(); return true, "retomado" end)
+btn(g5, "Interromper", "square", "operator", function() local ok = NN.StopTraining(); return ok, ok and "interrompendo após a época atual" or "não há treino em andamento" end)
+btn(g5, "Avaliar resultados", "chart-bar", "viewer", function()
+	local n, d = NN.Net, NN.LastData
+	if not n or not d then return false, "treine primeiro" end
+	local set = #d.val > 0 and d.val or d.train
+	local loss, acc, per = Training.Evaluate(n, set)
+	local arr = {}
+	for label, p in pairs(per) do arr[#arr + 1] = { label = label, acc = p.ok / p.n, n = p.n } end
+	table.sort(arr, function(a, b) if a.acc ~= b.acc then return a.acc < b.acc end return a.label < b.label end)
+	local t = {}
+	for k = 1, math.min(15, #arr) do t[k] = string.format("%s: %s (%d)", arr[k].label, pct(arr[k].acc), arr[k].n) end
+	showText("Avaliação", string.format("%d amostras · acerto %s · perda %.3f\nPiores categorias:\n%s", #set, pct(acc), loss, table.concat(t, "\n")))
+	return true, "avaliação aberta"
+end)
+g5:CreateStatusList({ Name = "Progresso", MaxRows = 6, UpdateRate = 1, Update = function()
+	local m = NN.Metrics[#NN.Metrics]
+	if not m then return { row("Estado", stateText()), row("Métricas", "nenhuma ainda") } end
+	return { row("Estado", stateText()), row("Época", m.epoch), row("Perda", string.format("%.4f", m.loss)), row("Treino", pct(m.trainAcc)),
+		row("Validação", pct(m.valAcc)), row("Taxa", string.format("%.4f", m.lr)) }
+end })
+g5:CreateStatusList({ Name = "Histórico de treinos", MaxRows = 6, UpdateRate = 3, Update = function()
+	local r = {}
+	for i = #NN.Versions, math.max(1, #NN.Versions - 5), -1 do
+		local v = NN.Versions[i]
+		r[#r + 1] = row("v" .. v.id .. " · " .. v.kind .. " · " .. v.status, "val " .. pct(v.valAcc) .. " · " .. v.params .. " params")
+	end
+	if #r == 0 then r[1] = row("—", "nenhum treino ainda") end
+	return r
+end })
+
+local g6 = T:AddLeftGroupbox({ Name = "Autoexpansão neural", Icon = "sprout" })
+g6:CreateToggle({ Name = "Auto-expandir quando faltar capacidade", CurrentValue = NN.Settings.autoExpand, Flag = "e_auto", Callback = toggleAct("auto-expansão", function(v) NN.Settings.autoExpand = v end) })
+g6:CreateToggle({ Name = "Auto-aprovar só se provar ser melhor", CurrentValue = NN.Settings.autoApprove, Flag = "e_appr", Callback = toggleAct("auto-aprovação", function(v) NN.Settings.autoApprove = v end) })
+g6:CreateSlider({ Name = "Nº da proposta", Range = { 1, 6 }, Increment = 1, CurrentValue = 1, Flag = "e_p", Callback = function(v) S.pnum = math.floor(v) end })
+btn(g6, "Detectar limitações", "search", "viewer", function()
+	local t = {}
+	for _, f in ipairs(Evo.Detect()) do t[#t + 1] = "• " .. f.text end
+	showText("Limitações detectadas", table.concat(t, "\n"))
+	return true, "relatório aberto"
+end)
+btn(g6, "Propor", "lightbulb", "operator", function() Evo.Propose(); return #NN.Proposals .. " proposta(s)" end)
+btn(g6, "Criar versão experimental", "flask-conical", "admin", function()
+	local p = NN.Proposals[S.pnum]
+	if not p then return false, "proponha primeiro / número inválido" end
+	return Evo.CreateExperimental(p)
+end)
+btn(g6, "Testar experimental", "timer", "operator", function() return Evo.TestAsync() end)
+btn(g6, "Comparar com a atual", "git-compare", "viewer", function()
+	local ex = NN.Experimental
+	if not ex then return false, "não há experimental" end
+	local t = AM.Compare(NN.Net, ex.net)
+	local r = ex.result
+	t[#t + 1] = r and string.format("Validação: %s → %s · perda %.3f → %.3f · %s", pct(r.baseValAcc), pct(r.valAcc), r.baseLoss, r.loss, r.better and "MELHOR" or "não melhor") or "Ainda não testada."
+	showText("Experimental × atual", table.concat(t, "\n"))
+	return true, "comparação aberta"
+end)
+btn(g6, "Aprovar", "circle-check", "admin", function() return Evo.Approve(false) end)
+btn(g6, "Aprovar mesmo assim", "circle-alert", "admin", function() return Evo.Approve(true) end)
+btn(g6, "Rejeitar", "circle-x", "admin", function() return Evo.Reject() end)
+g6:CreateStatusList({ Name = "Situação", MaxRows = 8, UpdateRate = 2, Update = function()
+	local r = {}
+	for _, f in ipairs(Evo.Detect()) do r[#r + 1] = row("•", clip(f.text, 90)) end
+	for i, p in ipairs(NN.Proposals) do if #r < 7 then r[#r + 1] = row("Proposta " .. i, Evo.Describe(p)) end end
+	local ex = NN.Experimental
+	r[#r + 1] = row("Experimental", ex and (Evo.Describe(ex.proposal) .. (ex.result and (" · val " .. pct(ex.result.valAcc)) or " · não testada")) or "nenhuma")
+	return r
+end })
+
+--==============================================================================
+-- 3. Aprendizado e Adaptação
+--==============================================================================
+T = Window:CreateTab({ Name = "Aprendizado", Icon = "graduation-cap" })
+g = T:AddLeftGroupbox({ Name = "Aprender e avaliar", Icon = "brain" })
+btn(g, "Aprender agora (incremental)", "play", "operator", function() return NN.StartTraining({}) end)
+btn(g, "Avaliar conhecimento", "chart-bar", "viewer", function()
+	local acc, n = FS.Evaluate()
+	if not acc then return false, tostring(n) end
+	return string.format("A rede acerta %s dos %d exemplos de feedback", pct(acc), n)
+end)
+btn(g, "Reconstruir padrões", "refresh-cw", "operator", function()
+	if not NN.LastData then return false, "treine primeiro" end
+	PR.Rebuild(NN.LastData.train)
+	return "padrões reconstruídos"
+end)
+btnAsk(g, "Detectar padrão em uma frase", "search", "viewer", "Frase para detectar padrões", "ex.: criar um sistema de moedas", "", false, function(txt)
+	local d = PR.Detect(txt)
+	if #d == 0 then return "nenhum padrão conhecido nessa frase" end
+	local t = {}
+	for _, x in ipairs(d) do t[#t + 1] = string.format("%s (%.2f) ← %s", x.label, x.score, table.concat(x.terms, ", ")) end
+	showText("Padrões detectados", table.concat(t, "\n"))
+	return true, "padrões abertos"
+end)
+btn(g, "Reverter última avaliação", "undo", "operator", function()
+	local e = FS.Events[#FS.Events]
+	if not e then return false, "nenhuma avaliação registrada" end
+	return FS.Revert(e.id)
+end)
+g:CreateStatusList({ Name = "Exemplos usados no último treino", MaxRows = 6, UpdateRate = 3, Update = function()
+	local d = NN.LastData
+	if not d then return { row("—", "nenhum treino ainda") } end
+	local by = {}
+	for _, s in ipairs(d.train) do by[s.src or "?"] = (by[s.src or "?"] or 0) + 1 end
+	local r = { row("Treino / validação", #d.train .. " / " .. #d.val), row("Categorias", #d.labels) }
+	local keys = {}
+	for k in pairs(by) do keys[#keys + 1] = k end
+	table.sort(keys)
+	for _, k in ipairs(keys) do if #r < 6 then r[#r + 1] = row(k, by[k]) end end
+	return r
+end })
+g2 = T:AddRightGroupbox({ Name = "Padrões e pontuação", Icon = "chart-network" })
+g2:CreateStatusList({ Name = "Padrões por categoria", MaxRows = 6, UpdateRate = 3, Update = function()
+	local r = {}
+	for _, l in ipairs(PR.Report(6)) do
+		local label, rest = l:match("^(.-):%s*(.*)$")
+		r[#r + 1] = row(label or l, clip(rest or "", 70))
+	end
+	if #r == 0 then r[1] = row("—", "ainda sem padrões") end
+	return r
+end })
+g2:CreateStatusList({ Name = "Pontuação por categoria", MaxRows = 6, UpdateRate = 3, Update = function()
+	local arr = {}
+	for label, sc in pairs(FS.Scores) do arr[#arr + 1] = { label = label, s = sc.up - sc.down, up = sc.up, down = sc.down } end
+	table.sort(arr, function(a, b) if math.abs(a.s) ~= math.abs(b.s) then return math.abs(a.s) > math.abs(b.s) end return a.label < b.label end)
+	local r = {}
+	for i = 1, math.min(6, #arr) do r[i] = row(arr[i].label, string.format("%+d (👍%d 👎%d)", arr[i].s, arr[i].up, arr[i].down)) end
+	if #r == 0 then r[1] = row("—", "sem avaliações ainda") end
+	return r
+end })
+g2:CreateStatusList({ Name = "Avaliações recentes", MaxRows = 6, UpdateRate = 3, Update = function()
+	local r = {}
+	for i = #FS.Events, math.max(1, #FS.Events - 5), -1 do
+		local e = FS.Events[i]
+		r[#r + 1] = row("#" .. e.id .. " " .. (e.verdict == "like" and "👍" or "👎") .. " " .. e.label, clip(e.request, 60))
+	end
+	if #r == 0 then r[1] = row("—", "nenhuma avaliação registrada") end
+	return r
+end })
+
+--==============================================================================
+-- 4. Memória e Conhecimento
+--==============================================================================
+T = Window:CreateTab({ Name = "Memória", Icon = "database" })
+g = T:AddLeftGroupbox({ Name = "Seus conhecimentos", Icon = "book-open" })
+g:CreateButton({ Name = "Adicionar conhecimento", Icon = "plus", Callback = function()
+	if not HUB.Can("operator") then notify("✖ Sem permissão (precisa de operator)"); return end
+	ask("Título do conhecimento", "ex.: Como fazer pulo duplo", "", false, function(title)
+		ask("Texto", "explique ou cole um exemplo de código", "", true, function(text)
+			ask("Tags (opcional)", "ex.: pulo jump movimento", "", false, function(tags)
+				act("Adicionar conhecimento", "operator", function()
+					local id, err = KS.Add(title, text, tags, "usuario")
+					if not id then return false, err end
+					return "registro #" .. id .. " criado e já disponível para o motor"
+				end)()
+			end)
+		end)
+	end)
+end })
+btnAsk(g, "Buscar", "search", "viewer", "Buscar nos seus registros", "palavras-chave", "", false, function(q)
+	local res, t = KS.Search(q, 12), {}
+	for _, e in ipairs(res) do t[#t + 1] = string.format("#%d · %s\n%s%s\n", e.id, e.title, clip(e.text, 200), (e.tags or "") ~= "" and ("\n🏷 " .. e.tags) or "") end
+	showText("Resultados (" .. #res .. ")", #res > 0 and table.concat(t, "\n") or "Nada encontrado.")
+	return true, #res .. " resultado(s)"
+end)
+btnAsk(g, "Editar texto de um registro", "pencil", "operator", "Número do registro", "ex.: 3", "", false, function(idText)
+	local id = tonumber(idText)
+	local e = id and KS.Find(id)
+	if not e then return false, "registro não encontrado" end
+	ask("Novo texto do registro #" .. id, "", e.text, true, function(text)
+		act("Editar registro #" .. id, "operator", function() return KS.Edit(id, { text = text }) end)()
+	end)
+	return true, "edite o texto na janela"
+end)
+btnAsk(g, "Remover registro", "trash-2", "operator", "Número do registro a remover", "ex.: 3", "", false, function(idText)
+	local id = tonumber(idText)
+	if not id then return false, "número inválido" end
+	return KS.Remove(id)
+end)
+btn(g, "Exportar registros", "upload", "viewer", function() local ok = copy(KS.Export()); return ok, ok and "registros copiados" or "este executor não tem setclipboard" end)
+btnAsk(g, "Importar registros", "download", "operator", "Cole o JSON exportado", "{...}", "", true, function(txt) return KS.Import(txt) end)
+btn(g, "Mapa 3D do conhecimento", "box", "viewer", function() view3D("conhecimento") end)
+g2 = T:AddRightGroupbox({ Name = "Memória do motor", Icon = "hard-drive" })
+g2:CreateStatusList({ Name = "Uso e limites", MaxRows = 6, UpdateRate = 2, Update = function()
+	local u = KS.Usage()
+	return {
+		row("Seus registros", u.entries .. " / " .. u.maxEntries),
+		row("Conversas guardadas", u.conv .. " / " .. u.maxConv),
+		row("Base total do motor", u.kb),
+		row("Regras ensinadas", #(M.ProjectContext.Taught or {})),
+		row("Skills carregadas", #(M.SkillManager.Skills or {})),
+		row("Memória Lua", string.format("%.0f KB", collectgarbage("count"))),
+	}
+end })
+g2:CreateStatusList({ Name = "Conversas recentes", MaxRows = 6, UpdateRate = 2, Update = function()
+	local r, C2 = {}, KS.Conversation
+	for i = #C2, math.max(1, #C2 - 5), -1 do r[#r + 1] = row(fmtTime(C2[i].t) .. " · você", clip(C2[i].user, 70)) end
+	if #r == 0 then r[1] = row("—", "sem conversas ainda") end
+	return r
+end })
+g2:CreateStatusList({ Name = "Seus registros", MaxRows = 8, UpdateRate = 3, Update = function()
+	local r = {}
+	for i = #KS.Entries, math.max(1, #KS.Entries - 7), -1 do r[#r + 1] = row("#" .. KS.Entries[i].id, clip(KS.Entries[i].title, 60)) end
+	if #r == 0 then r[1] = row("—", "nenhum registro seu ainda") end
+	return r
+end })
+
+--==============================================================================
+-- 5. Gerenciador de Módulos
+--==============================================================================
+T = Window:CreateTab({ Name = "Módulos", Icon = "blocks" })
+local TOGGLES = { NeuralBridge = { Config, "AutoLoadNeural" }, SkillManager = { Config, "AutoLoadSkills" }, NeuralCore = { Config, "NeuralRanking" }, NinjaNN = { NN.Settings, "autoLearn" } }
+local function fnCount(m) local n = 0; if type(m) == "table" then for _, v in pairs(m) do if type(v) == "function" then n = n + 1 end end end return n end
+local allModules = {}
+for k, v in pairs(M) do allModules[k] = v end
+allModules.AdminHub = HUB
+
+g = T:AddLeftGroupbox({ Name = "Módulos carregados", Icon = "package" })
+g:CreateStatusList({ Name = "Módulos", MaxRows = 20, UpdateRate = 3, Update = function()
+	local names, r = {}, {}
+	for k in pairs(allModules) do names[#names + 1] = k end
+	table.sort(names)
+	for _, name in ipairs(names) do
+		local tg = TOGGLES[name]
+		r[#r + 1] = row(name, fnCount(allModules[name]) .. " funções" .. (tg and (" · " .. tg[2] .. " " .. (tg[1][tg[2]] and "ligado" or "desligado")) or ""))
+	end
+	return r
+end })
+for name, tg in pairs(TOGGLES) do
+	g:CreateToggle({ Name = name .. " (" .. tg[2] .. ")", CurrentValue = tg[1][tg[2]] and true or false, Flag = "mod_" .. name, Callback = toggleAct("recurso " .. name, function(v) tg[1][tg[2]] = v end) })
+end
+btnAsk(g, "Inspecionar módulo", "search", "viewer", "Nome do módulo", "ex.: NeuralCore", "", false, function(name)
+	local m = allModules[trim(name)]
+	if not m then return false, "módulo não encontrado" end
+	local fns, other = {}, {}
+	if type(m) == "table" then for k, v in pairs(m) do if type(v) == "function" then fns[#fns + 1] = tostring(k) else other[#other + 1] = tostring(k) end end end
+	table.sort(fns); table.sort(other)
+	showText("Módulo " .. trim(name), "funções (" .. #fns .. "):\n" .. table.concat(fns, ", ") .. "\n\ncampos (" .. #other .. "):\n" .. table.concat(other, ", "))
+	return true, "módulo aberto"
+end)
+btn(g, "Mapa 3D de dependências", "box", "viewer", function() view3D("modulos") end)
+btn(g, "Detectar conflitos", "triangle-alert", "viewer", function()
+	local issues = {}
+	for name, deps in pairs(HUB.Deps) do
+		if not allModules[name] then issues[#issues + 1] = "módulo ausente: " .. name end
+		for _, d in ipairs(deps) do if not allModules[d] then issues[#issues + 1] = name .. " depende de " .. d .. ", que não está carregado" end end
+	end
+	if Config.UseNeural and not M.NeuralBridge.Ready() then issues[#issues + 1] = "UseNeural ligado, mas o gerador da pasta RedeNeural não está carregado" end
+	if NN.Settings.ranking ~= Config.NeuralRanking then issues[#issues + 1] = "ranking da rede: Hub=" .. tostring(NN.Settings.ranking) .. " · NeuralRanking=" .. tostring(Config.NeuralRanking) end
+	if not NN.BoundMain then issues[#issues + 1] = "a rede não está ligada ao motor (sem aprendizado automático)" end
+	table.sort(issues)
+	showText("Conflitos", #issues == 0 and "✔ Nenhum conflito encontrado." or ("⚠ " .. table.concat(issues, "\n⚠ ")))
+	return true, "relatório aberto"
+end)
+btn(g, "Executar testes", "flask-conical", "operator", function()
+	local ok, lines = NN.RunTests()
+	local okT, rep = pcall(API.RunTests)
+	showText("Testes", (ok and "✔ rede: todos passaram\n" or "✖ rede: há falhas\n") .. table.concat(lines, "\n") .. "\n\n" .. (okT and tostring(rep) or tostring(rep)))
+	return ok, ok and "testes da rede passaram" or "há testes falhando"
+end)
+
+g2 = T:AddRightGroupbox({ Name = "Módulos do usuário", Icon = "code" })
+g2:CreateStatusList({ Name = "Seus módulos", MaxRows = 6, UpdateRate = 3, Update = function()
+	local r = {}
+	for _, m in ipairs(HUB.UserModules) do r[#r + 1] = row(m.name, #m.versions .. " versão(ões)") end
+	if #r == 0 then r[1] = row("—", "nenhum módulo seu ainda") end
+	return r
+end })
+local function findUserModule(name) for i, m in ipairs(HUB.UserModules) do if m.name == name then return m, i end end end
+local function cleanName(s) return (trim(s):gsub("[^%w_%-]", "")) end
+local function getLoad()
+	local fn = M.ExecutorAdapter.Lookup and M.ExecutorAdapter.Lookup("loadstring")
+	if type(fn) == "function" then return fn end
+	local ok, f = pcall(function() return loadstring end)
+	if ok and type(f) == "function" then return f end
+end
+g2:CreateButton({ Name = "Salvar módulo (nova versão)", Icon = "save", Callback = function()
+	if not HUB.Can("admin") then notify("✖ Sem permissão (precisa de admin)"); return end
+	ask("Nome do módulo", "letras, números, _ e -", "", false, function(nm)
+		ask("Código do módulo", "-- seu código Lua", (findUserModule(cleanName(nm)) and findUserModule(cleanName(nm)).versions[#findUserModule(cleanName(nm)).versions].code) or "", true, function(code)
+			act("Salvar módulo", "admin", function()
+				local name = cleanName(nm)
+				if name == "" or trim(code) == "" then return false, "informe nome e código" end
+				if #code > 60000 then return false, "código grande demais" end
+				local m = findUserModule(name)
+				if not m then m = { name = name, versions = {} }; HUB.UserModules[#HUB.UserModules + 1] = m end
+				m.versions[#m.versions + 1] = { t = os.time(), code = code }
+				while #m.versions > 10 do table.remove(m.versions, 1) end
+				HUB.SaveHub()
+				return "módulo " .. name .. " salvo (v" .. #m.versions .. ")"
+			end)()
+		end)
+	end)
+end })
+btnAsk(g2, "Validar sintaxe", "check", "operator", "Nome do módulo", "", "", false, function(nm)
+	local m = findUserModule(cleanName(nm))
+	if not m then return false, "módulo não encontrado" end
+	local ls = getLoad()
+	if not ls then return false, "este executor não tem loadstring" end
+	local f, err = ls(m.versions[#m.versions].code, "=" .. m.name)
+	if not f then showText("Erro de sintaxe", tostring(err)); return false, "erro de sintaxe (veja a janela)" end
+	return "sintaxe válida"
+end)
+btnAsk(g2, "Executar módulo (pede confirmação)", "play", "admin", "Nome do módulo a executar", "", "", false, function(nm)
+	local m = findUserModule(cleanName(nm))
+	if not m then return false, "módulo não encontrado" end
+	Library:Confirm({ Title = "Executar \"" .. m.name .. "\"? Isto roda código com acesso total.", ConfirmText = "Executar", Callback = function()
+		act("Executar módulo " .. m.name, "admin", function()
+			local ls = getLoad()
+			if not ls then return false, "este executor não tem loadstring" end
+			local f, err = ls(m.versions[#m.versions].code, "=" .. m.name)
+			if not f then return false, tostring(err) end
+			local ok, res = pcall(f)
+			return ok, ok and ("executado" .. (res ~= nil and (" → " .. clip(tostring(res), 100)) or "")) or tostring(res)
+		end)()
+	end })
+	return true, "confirme na janela"
+end)
+btnAsk(g2, "Restaurar versão anterior", "undo", "admin", "Nome do módulo", "", "", false, function(nm)
+	local m = findUserModule(cleanName(nm))
+	if not m then return false, "módulo não encontrado" end
+	if #m.versions < 2 then return false, "não há versão anterior" end
+	table.remove(m.versions)
+	HUB.SaveHub()
+	return "voltou para a versão " .. #m.versions
+end)
+btnAsk(g2, "Apagar módulo", "trash-2", "admin", "Nome do módulo", "", "", false, function(nm)
+	local m, i = findUserModule(cleanName(nm))
+	if not m then return false, "módulo não encontrado" end
+	table.remove(HUB.UserModules, i)
+	HUB.SaveHub()
+	return "módulo apagado"
+end)
+
+--==============================================================================
+-- 6. Motor de IA
+--==============================================================================
+T = Window:CreateTab({ Name = "Motor de IA", Icon = "cpu" })
+g = T:AddLeftGroupbox({ Name = "Processamento", Icon = "activity" })
+g:CreateStatusList({ Name = "Mensagens e fila", MaxRows = 6, UpdateRate = 1, Update = function()
+	local st, S2 = NN.Stats, Main.State or {}
+	return {
+		row("Mensagens processadas", st.messages),
+		row("Tempo médio · último", string.format("%.1f ms · %.1f ms", st.messages > 0 and st.totalMs / st.messages or 0, st.lastMs)),
+		row("Erros", st.errors),
+		row("Fila", stateText()),
+		row("Código no editor", #(S2.code or "") .. " caracteres"),
+		row("Histórico de mensagens (até)", Config.MaxHistory),
+	}
+end })
+btnAsk(g, "Interpretar frase (tokens e padrões)", "scan-text", "viewer", "Frase para interpretar", "ex.: crie um script de pulo duplo", "", false, function(t)
+	local toks = M.Learning.Tokens(t)
+	local lines = { "Tokens: " .. table.concat(toks, ", "), "Entradas ativas na rede: " .. #NN.Features(t) }
+	local r = NN.Predict(t)
+	if r then
+		local p = {}
+		for _, x in ipairs(r.top) do p[#p + 1] = x.label .. " " .. pct(x.prob) end
+		lines[#lines + 1] = "Rede: " .. table.concat(p, " · ")
+	end
+	for _, d in ipairs(PR.Detect(t)) do lines[#lines + 1] = string.format("Padrão: %s (%.2f)", d.label, d.score) end
+	showText("Interpretação", table.concat(lines, "\n"))
+	return true, "interpretação aberta"
+end)
+btnAsk(g, "Enviar pedido ao motor", "send", "operator", "Pedido para o motor", "ex.: crie um script de pulo duplo", "", false, function(t)
+	if trim(t) == "" then return false, "digite um pedido" end
+	local r = Main.HandleChat(t)
+	showText("Resposta do motor", tostring(r))
+	return true, "resposta aberta"
+end)
+g2 = T:AddRightGroupbox({ Name = "Analisador de código Luau", Icon = "code" })
+btnAsk(g2, "Analisar código", "bug", "viewer", "Cole um código Luau", "", "", true, function(code)
+	local res = API.Analyze(code)
+	local t = {}
+	for i, d in ipairs(res.diagnostics) do if i <= 20 then t[#t + 1] = M.Diagnostics.Format(d, false) end end
+	showText("Diagnósticos (" .. #res.diagnostics .. ")", #res.diagnostics == 0 and "✔ Nenhum problema encontrado." or table.concat(t, "\n"))
+	return true, #res.diagnostics .. " diagnóstico(s)"
+end)
+btnAsk(g2, "Prévia de autocorreção", "wand-sparkles", "viewer", "Cole o código a corrigir", "", "", true, function(code)
+	local res = API.Analyze(code)
+	local props = M.AutoFix.Propose(code, res)
+	showText("Autocorreção (prévia)", #props == 0 and "Nada a corrigir automaticamente." or M.AutoFix.Describe(code, props))
+	return true, #props .. " correção(ões) proposta(s)"
+end)
+g2:CreateStatusList({ Name = "Logs de execução", MaxRows = 8, UpdateRate = 2, Update = function() return logRows(nil, 8) end })
+
+--==============================================================================
+-- 7. Ferramentas e Integrações
+--==============================================================================
+T = Window:CreateTab({ Name = "Integrações", Icon = "plug" })
+local function urlEncode(s) return (s:gsub("[^%w%-%._~]", function(ch) return string.format("%%%02X", ch:byte()) end)) end
+local function urlDecode(s) return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)) end
+local function strip(s)
+	s = s:gsub("<.->", "")
+	s = s:gsub("&amp;", "&"):gsub("&quot;", '"'):gsub("&#x27;", "'"):gsub("&lt;", "<"):gsub("&gt;", ">")
+	return trim(s)
+end
+g = T:AddLeftGroupbox({ Name = "Pesquisa na internet", Icon = "globe" })
+btnAsk(g, "Pesquisar", "search", "operator", "O que pesquisar?", "ex.: roblox tween service", "", false, function(q)
+	if trim(q) == "" then return false, "digite o que pesquisar" end
+	local ok, body = M.ExecutorAdapter.HttpGet("https://html.duckduckgo.com/html/?q=" .. urlEncode(q))
+	if not ok then return false, "falha na pesquisa: " .. clip(body, 100) end
+	local results = {}
+	for href, title in body:gmatch('class="result__a"[^>]-href="(.-)"[^>]*>(.-)</a>') do
+		local real = href:match("uddg=([^&]+)")
+		results[#results + 1] = { title = strip(title), url = real and urlDecode(real) or href }
+		if #results >= 6 then break end
+	end
+	local k = 0
+	for snippet in body:gmatch('class="result__snippet"[^>]*>(.-)</a>') do
+		k = k + 1
+		if results[k] then results[k].snippet = strip(snippet) end
+	end
+	if #results == 0 then return false, "nenhum resultado" end
+	local t = {}
+	for i, r in ipairs(results) do t[#t + 1] = i .. ". " .. r.title .. "\n" .. clip(r.snippet or "", 180) .. "\n" .. clip(r.url, 90) .. "\n" end
+	showText("Resultados para \"" .. q .. "\"", table.concat(t, "\n") .. "\nDepois de ler, você pode salvar um na base.")
+	ask("Salvar qual resultado na base? (1-" .. #results .. ", vazio = nenhum)", "número", "", false, function(n)
+		local r = results[tonumber(n) or 0]
+		if not r then return end
+		act("Salvar pesquisa na base", "operator", function()
+			local id, err = KS.Add(r.title, (r.snippet or r.title) .. "\nFonte: " .. r.url, "internet pesquisa", "internet")
+			if not id then return false, err end
+			return "salvo como registro #" .. id
+		end)()
+	end)
+	return true, #results .. " resultado(s)"
+end)
+g:CreateStatusList({ Name = "Fontes de conhecimento", MaxRows = 8, UpdateRate = 5, Update = function()
+	local by, r = {}, {}
+	for _, e in ipairs(M.KnowledgeBase.Entries) do local o = tostring(e.origin):match("^[^:]+") or "?"; by[o] = (by[o] or 0) + 1 end
+	for k, v in pairs(by) do r[#r + 1] = row(k, v) end
+	table.sort(r, function(a, b) return a.Text < b.Text end)
+	r[#r + 1] = row("skills carregadas", #(M.SkillManager.Skills or {}))
+	return r
+end })
+g2 = T:AddRightGroupbox({ Name = "APIs e estado", Icon = "server" })
+g2:CreateStatusList({ Name = "Integrações", MaxRows = 8, UpdateRate = 2, Update = function()
+	local webhook = Config.DiscordWebhookUrl ~= nil and Config.DiscordWebhookUrl ~= ""
+	local n, caps = HUB.Net, M.ExecutorAdapter.Caps
+	return {
+		row("Skills", clip(tostring(M.SkillManager.Status), 70)),
+		row("RedeNeural (repositório)", clip(tostring(M.NeuralBridge.Status), 70)),
+		row("GitHub token", M.GitHubSync.Masked()),
+		row("Discord webhook", webhook and "configurado (oculto)" or "não configurado"),
+		row("Requisições nesta sessão", n.count .. " · falhas " .. n.errors),
+		row("Tempo médio · último", string.format("%.0f ms · %.0f ms", n.count > 0 and n.ms / n.count or 0, n.last)),
+		row("Executor", M.ExecutorAdapter.Name),
+		row("Permissões", (caps.files and "arquivos " or "") .. (caps.httpget and "http " or "") .. (caps.clipboard and "clipboard " or "") .. (caps.loadstring and "loadstring" or "")),
+	}
+end })
+btn(g2, "Sincronizar skills", "refresh-cw", "operator", function() M.SkillManager.Sync(); Main.Emit("skills"); return tostring(M.SkillManager.Status) end)
+btn(g2, "Sincronizar RedeNeural", "cloud-download", "operator", function() M.NeuralBridge.Sync(); return tostring(M.NeuralBridge.Status) end)
+btn(g2, "Remover token do GitHub", "key", "admin", function() M.GitHubSync.SetToken(""); return "token removido da memória" end)
+
+--==============================================================================
+-- 8. Testes e Diagnósticos
+--==============================================================================
+T = Window:CreateTab({ Name = "Testes", Icon = "flask-conical" })
+g = T:AddLeftGroupbox({ Name = "Testes", Icon = "flask-conical" })
+btn(g, "Testar rede neural", "brain-circuit", "operator", function()
+	local ok, lines = NN.RunTests()
+	showText("Testes da rede neural", table.concat(lines, "\n"))
+	return ok, ok and "todos os testes da rede passaram" or "há testes da rede falhando"
+end)
+btn(g, "Testes do motor", "cpu", "operator", function() showText("Testes do motor", tostring(API.RunTests())); return true, "relatório aberto" end)
+btn(g, "Geração de código", "code", "operator", function()
+	local lines = {}
+	for _, p in ipairs({ "crie um script de pulo duplo", "crie uma gui com um botão", "faça um loop que imprime números" }) do
+		local ok, res = pcall(M.RuleEngine.Generate, p)
+		if ok and res and res.ok then
+			local an = API.Analyze(res.code)
+			lines[#lines + 1] = string.format("✔ \"%s\" → %d linhas · %d diagnóstico(s)", p, select(2, res.code:gsub("\n", "\n")) + 1, #an.diagnostics)
+		else
+			lines[#lines + 1] = "✖ \"" .. p .. "\" → " .. tostring(ok and res and res.message or res)
+		end
+	end
+	showText("Geração de código", table.concat(lines, "\n"))
+	return true, "relatório aberto"
+end)
+btn(g, "Conhecimento", "book-open", "operator", function()
+	local lines = {}
+	for _, q in ipairs({ "tween", "remote event", "datastore", "loop" }) do
+		local ok, r = pcall(M.KnowledgeBase.Search, q, 3)
+		lines[#lines + 1] = (ok and r and #r > 0 and "✔ " or "✖ ") .. "\"" .. q .. "\" → " .. (ok and r and #r or 0) .. " resultado(s)"
+	end
+	showText("Conhecimento", table.concat(lines, "\n"))
+	return true, "relatório aberto"
+end)
+btn(g, "Memória", "hard-drive", "viewer", function()
+	local u = KS.Usage()
+	showText("Memória", string.format("Registros %d/%d · conversas %d/%d · Lua %.0f KB\n%s", u.entries, u.maxEntries, u.conv, u.maxConv, collectgarbage("count"), u.entries <= u.maxEntries and "✔ dentro dos limites" or "✖ acima do limite"))
+	return true, "relatório aberto"
+end)
+g2 = T:AddRightGroupbox({ Name = "Diagnósticos", Icon = "stethoscope" })
+btn(g2, "Precisão por categoria", "chart-bar", "viewer", function()
+	local n, d = NN.Net, NN.LastData
+	if not n or not d then return false, "treine primeiro" end
+	local _, acc, per = Training.Evaluate(n, #d.val > 0 and d.val or d.train)
+	local arr = {}
+	for label, p in pairs(per) do arr[#arr + 1] = { label = label, a = p.ok / p.n, n = p.n } end
+	table.sort(arr, function(a, b) if a.a ~= b.a then return a.a < b.a end return a.label < b.label end)
+	local t = { "Acerto geral " .. pct(acc) }
+	for i = 1, math.min(25, #arr) do t[#t + 1] = string.format("%s: %s (%d)", arr[i].label, pct(arr[i].a), arr[i].n) end
+	showText("Precisão por categoria", table.concat(t, "\n"))
+	return true, "relatório aberto"
+end)
+btn(g2, "Detectar regressões", "trending-down", "viewer", function()
+	local t, prev = {}, nil
+	for _, v in ipairs(NN.Versions) do
+		if v.status == "aprovada" then
+			if prev and v.valAcc < prev.valAcc - 0.02 then t[#t + 1] = string.format("⚠ v%d caiu %s → %s em relação a v%d", v.id, pct(prev.valAcc), pct(v.valAcc), prev.id) end
+			prev = v
+		end
+	end
+	showText("Regressões", #t == 0 and "✔ Nenhuma regressão entre as versões aprovadas." or table.concat(t, "\n"))
+	return true, "relatório aberto"
+end)
+btn(g2, "Desempenho", "gauge", "viewer", function()
+	local n = NN.Net
+	if not n then return false, "sem rede" end
+	local t0 = os.clock()
+	for _ = 1, 200 do Network.Forward(n, NN.Features("crie um script de pulo duplo para o jogador")) end
+	local ms = (os.clock() - t0) * 1000
+	showText("Desempenho", string.format("200 inferências (com extração de features): %.0f ms · %.2f ms cada · %d parâmetros", ms, ms / 200, Network.Counts(n).params))
+	return true, "relatório aberto"
+end)
+btnAsk(g2, "Comparar motor × rede", "git-compare", "operator", "Pedido para comparar", "ex.: crie um script de pulo duplo", "", false, function(t)
+	if trim(t) == "" then return false, "digite um pedido" end
+	local ok, res = pcall(M.RuleEngine.Generate, t)
+	local lines = { "Motor de regras: " .. ((ok and res and res.ok) and ("gerou código (regras: " .. table.concat(res.rules or {}, ", ") .. ")") or "não resolveu") }
+	local r = NN.Predict(t)
+	if r then
+		local p = {}
+		for _, x in ipairs(r.top) do p[#p + 1] = x.label .. " " .. pct(x.prob) end
+		lines[#lines + 1] = "Rede neural: " .. table.concat(p, " · ")
+	end
+	showText("Motor × rede", table.concat(lines, "\n"))
+	return true, "comparação aberta"
+end)
+btn(g2, "Relatório de qualidade (copia)", "file-text", "operator", function()
+	local m, lines = meta(), {}
+	lines[#lines + 1] = "RELATÓRIO NINJ AI · " .. os.date("%Y-%m-%d %H:%M")
+	lines[#lines + 1] = "Rede: " .. NN.Summary()
+	if m then lines[#lines + 1] = string.format("Treino %s · validação %s · perda %.3f · %d amostras", pct(m.trainAcc), pct(m.valAcc), m.loss, m.samples) end
+	lines[#lines + 1] = string.format("Feedback 👍 %d · 👎 %d · exemplos %d", FS.Total.up, FS.Total.down, #FS.Examples)
+	lines[#lines + 1] = string.format("Mensagens %d · erros %d · erros registrados %d", NN.Stats.messages, NN.Stats.errors, #NN.Errors)
+	local okT = NN.RunTests()
+	lines[#lines + 1] = "Testes da rede: " .. (okT and "todos passaram" or "há falhas")
+	local text = table.concat(lines, "\n")
+	copy(text)
+	showText("Relatório de qualidade", text)
+	return true, "relatório aberto (e copiado, se o executor permitir)"
+end)
+
+--==============================================================================
+-- 9. Segurança e Permissões
+--==============================================================================
+T = Window:CreateTab({ Name = "Segurança", Icon = "shield-check" })
+g = T:AddLeftGroupbox({ Name = "Acesso", Icon = "lock" })
+g:CreateStatusList({ Name = "Situação", MaxRows = 6, UpdateRate = 1, Update = function()
+	return {
+		row("Seu nível agora", HUB.role),
+		row("PIN de administrador", HUB.Auth.admin and "definido" or "não definido (qualquer um com o script é admin)"),
+		row("PIN de operador", HUB.Auth.operator and "definido" or "não definido"),
+		row("Proteção de configurações", HUB.Auth.protect and (((HUB.editUntil or 0) > os.time()) and "ligada · edições liberadas" or "ligada · edições bloqueadas") or "desligada"),
+		row("Token do GitHub", M.GitHubSync.Masked()),
+		row("Níveis", "leitor vê · operador treina/ensina · admin edita tudo"),
+	}
+end })
+g:CreateButton({ Name = "Desbloquear com PIN", Icon = "lock-open", Callback = function()
+	ask("PIN", "digite seu PIN", "", false, function(pin)
+		local role = HUB.Unlock(pin)
+		notify(role and ("Sessão iniciada como " .. role) or "✖ PIN incorreto", role ~= nil)
+	end)
+end })
+btn(g, "Bloquear agora", "lock", "viewer", function() return HUB.LockNow() end)
+btnAsk(g, "Definir PIN de administrador", "key-round", "admin", "Novo PIN de administrador", "mínimo 4 caracteres", "", false, function(pin) return HUB.SetPin("admin", pin) end)
+btnAsk(g, "Definir PIN de operador", "key", "admin", "Novo PIN de operador", "mínimo 4 caracteres", "", false, function(pin) return HUB.SetPin("operator", pin) end)
+btn(g, "Remover PINs", "key-off", "admin", function() return HUB.ClearPins() end)
+btn(g, "Proteger configurações (alternar)", "shield", "admin", function() return HUB.ToggleProtect() end)
+g:CreateButton({ Name = "Liberar edições por 5 min (PIN)", Icon = "lock-keyhole-open", Callback = function()
+	ask("PIN de administrador", "digite o PIN", "", false, function(pin)
+		act("Liberar edições", "admin", function() return HUB.UnlockEdits(pin) end, true)()
+	end)
+end })
+btn(g, "Validar código do editor", "bug", "viewer", function()
+	local code = Main.State.code or ""
+	if trim(code) == "" then return false, "o editor está vazio" end
+	local res = API.Analyze(code)
+	return #res.diagnostics == 0 and "sem diagnósticos" or (#res.diagnostics .. " diagnóstico(s) no código atual")
+end)
+g2 = T:AddRightGroupbox({ Name = "Limites de recursos", Icon = "gauge" })
+local LIM = { mn = NN.Settings.maxNeurons, ml = NN.Settings.maxLayers, mp = NN.Settings.maxParams, me = NN.Settings.maxEpochs }
+g2:CreateSlider({ Name = "Máx. de neurônios", Range = { 32, 2048 }, Increment = 32, CurrentValue = math.min(2048, LIM.mn), Flag = "lim_n", Callback = function(v) LIM.mn = math.floor(v) end })
+g2:CreateSlider({ Name = "Máx. de camadas", Range = { 3, 16 }, Increment = 1, CurrentValue = math.min(16, LIM.ml), Flag = "lim_l", Callback = function(v) LIM.ml = math.floor(v) end })
+g2:CreateSlider({ Name = "Máx. de parâmetros", Range = { 1000, 500000 }, Increment = 1000, CurrentValue = math.min(500000, LIM.mp), Flag = "lim_p", Callback = function(v) LIM.mp = math.floor(v) end })
+g2:CreateSlider({ Name = "Máx. de épocas", Range = { 10, 1000 }, Increment = 10, CurrentValue = math.min(1000, LIM.me), Flag = "lim_e", Callback = function(v) LIM.me = math.floor(v) end })
+btn(g2, "Aplicar limites", "check", "admin", function()
+	local s = NN.Settings
+	s.maxNeurons, s.maxLayers, s.maxParams, s.maxEpochs = LIM.mn, LIM.ml, LIM.mp, LIM.me
+	NN.Touch()
+	return "limites aplicados em toda a rede"
+end)
+g2:CreateStatusList({ Name = "Registro de ações administrativas", MaxRows = 8, UpdateRate = 2, Update = function() return logRows({ admin = true }, 8) end })
+
+--==============================================================================
+-- 10. Versões e Recuperação
+--==============================================================================
+T = Window:CreateTab({ Name = "Versões", Icon = "history" })
+g = T:AddLeftGroupbox({ Name = "Salvar e recuperar", Icon = "save" })
+g:CreateStatusList({ Name = "Situação", MaxRows = 4, UpdateRate = 2, Update = function()
+	return {
+		row("Motor · rede", tostring(API.Version) .. " · " .. NN.Version),
+		row("Rede ativa", NN.Summary()),
+		row("Experimental", NN.Experimental and Evo.Describe(NN.Experimental.proposal) or "nenhuma"),
+		row("Arquivo", NN.Settings.file .. " · " .. (NN.Dirty and "alterações não salvas" or "salvo")),
+	}
+end })
+btn(g, "Salvar checkpoint agora", "save", "operator", function() local ok, w = MC.Save(); return ok, ok and ("checkpoint salvo em " .. tostring(w)) or tostring(w) end)
+btn(g, "Carregar checkpoint", "folder-open", "admin", function() return MC.Load() end)
+btn(g, "Recuperar do .bak", "history", "admin", function()
+	local raw = M.ExecutorAdapter.Load(NN.Settings.file .. ".bak")
+	if not raw then return false, "não há cópia .bak" end
+	local ok, d = pcall(HttpService.JSONDecode, HttpService, raw)
+	if not ok then return false, ".bak corrompido" end
+	return MC.Restore(d)
+end)
+btnAsk(g, "Criar ponto de restauração", "bookmark-plus", "operator", "Nome do ponto", "ex.: antes de testar", "", false, function(name) return MC.Point(name) end)
+btnAsk(g, "Restaurar versão da rede", "undo", "admin", "Número da versão (ex.: 3)", "só as 4 últimas aprovadas ficam guardadas", "", false, function(n)
+	local id = tonumber((tostring(n):gsub("^v", "")))
+	if not id then return false, "número inválido" end
+	return MC.RestoreVersion(id)
+end)
+btnAsk(g, "Restaurar ponto", "bookmark-check", "admin", "Número do ponto", "veja a lista ao lado", "", false, function(n)
+	local id = tonumber(n)
+	if not id then return false, "número inválido" end
+	return MC.RestorePoint(id)
+end)
+btn(g, "Treinar do zero", "rotate-ccw", "admin", function() return NN.StartTraining({ scratch = true }) end)
+btn(g, "Exportar backup (copia)", "upload", "viewer", function()
+	local s, err = MC.Export()
+	if not s then return false, tostring(err) end
+	local ok = copy(s)
+	return ok, ok and ("backup copiado (" .. math.floor(#s / 1024) .. " KB)") or "este executor não tem setclipboard"
+end)
+btnAsk(g, "Importar backup", "download", "admin", "Cole o backup exportado", "{...}", "", true, function(txt) return MC.Import(txt) end)
+g2 = T:AddRightGroupbox({ Name = "Histórico", Icon = "git-branch" })
+g2:CreateStatusList({ Name = "Versões da rede", MaxRows = 10, UpdateRate = 2, Update = function()
+	local r = {}
+	for i = #NN.Versions, math.max(1, #NN.Versions - 9), -1 do
+		local v = NN.Versions[i]
+		r[#r + 1] = row("v" .. v.id .. (v.id == NN.ActiveVersion and " ★" or "") .. " · " .. v.kind .. " · " .. v.status, "val " .. pct(v.valAcc) .. " · " .. v.params .. " params" .. (NN.Models[v.id] and " · restaurável" or ""))
+	end
+	if #r == 0 then r[1] = row("—", "sem versões ainda") end
+	return r
+end })
+g2:CreateStatusList({ Name = "Pontos de restauração", MaxRows = 5, UpdateRate = 2, Update = function()
+	local r = {}
+	for i = #NN.Points, 1, -1 do local p = NN.Points[i]; r[#r + 1] = row("#" .. p.id .. " · " .. p.name, "v" .. tostring(p.version) .. " · " .. fmtTime(p.t)) end
+	if #r == 0 then r[1] = row("—", "nenhum ponto criado") end
+	return r
+end })
+
+--==============================================================================
+-- 11. Configurações Gerais
+--==============================================================================
+T = Window:CreateTab({ Name = "Configurações", Icon = "settings" })
+g = T:AddLeftGroupbox({ Name = "Identidade e aprendizado", Icon = "user" })
+g:CreateStatusList({ Name = "Atual", MaxRows = 2, UpdateRate = 2, Update = function()
+	return { row("Nome da IA", NN.Settings.name), row("Arquivo do checkpoint", NN.Settings.file) }
+end })
+btnAsk(g, "Renomear a IA", "pencil", "admin", "Nome da IA (até 30 caracteres)", "", NN.Settings.name, false, function(name)
+	name = trim(name)
+	if name == "" or #name > 30 then return false, "nome inválido" end
+	NN.Settings.name = name
+	NN.Touch()
+	return "nome alterado para " .. name
+end)
+g:CreateToggle({ Name = "Aprender automaticamente", CurrentValue = NN.Settings.autoLearn, Flag = "c_autolearn", Callback = toggleAct("aprender automaticamente", function(v) NN.Settings.autoLearn = v end) })
+g:CreateToggle({ Name = "Rede ajuda a ordenar intenções", CurrentValue = NN.Settings.ranking and Config.NeuralRanking, Flag = "c_rank", Callback = toggleAct("ranking da rede", function(v) NN.Settings.ranking = v; Config.NeuralRanking = v end) })
+g:CreateToggle({ Name = "Usar gerador da pasta RedeNeural", CurrentValue = Config.UseNeural and true or false, Flag = "c_useneural", Callback = toggleAct("usar RedeNeural", function(v) Config.UseNeural = v end) })
+g:CreateToggle({ Name = "Registro detalhado no console", CurrentValue = NN.Settings.verbose, Flag = "c_verbose", Callback = toggleAct("registro detalhado", function(v) NN.Settings.verbose = v end) })
+g:CreateSlider({ Name = "Novos exemplos para retreinar", Range = { 1, 100 }, Increment = 1, CurrentValue = math.min(100, NN.Settings.autoLearnEvery), Flag = "c_ale", Callback = silentAdmin(function(v) NN.Settings.autoLearnEvery = math.floor(v) end) })
+g:CreateSlider({ Name = "Treino do NeuralCore a cada N 👍 (0 = nunca)", Range = { 0, 100 }, Increment = 1, CurrentValue = math.min(100, Config.AutoTrainEvery or 0), Flag = "c_ate", Callback = silentAdmin(function(v) Config.AutoTrainEvery = math.floor(v) end) })
+g2 = T:AddRightGroupbox({ Name = "Geração, memória e desempenho", Icon = "sliders-horizontal" })
+g2:CreateSlider({ Name = "Limiar de reuso de correções", Range = { 0.3, 1 }, Increment = 0.05, CurrentValue = math.max(0.3, math.min(1, Config.MatchThreshold or 0.6)), Flag = "c_mt", Callback = silentAdmin(function(v) Config.MatchThreshold = v end) })
+g2:CreateSlider({ Name = "Mensagens no histórico", Range = { 5, 500 }, Increment = 5, CurrentValue = math.max(5, math.min(500, Config.MaxHistory or 60)), Flag = "c_mh", Callback = silentAdmin(function(v) Config.MaxHistory = math.floor(v) end) })
+g2:CreateSlider({ Name = "Correções guardadas (máx.)", Range = { 50, 2000 }, Increment = 50, CurrentValue = math.max(50, math.min(2000, Config.MaxCorrections or 400)), Flag = "c_mc", Callback = silentAdmin(function(v) Config.MaxCorrections = math.floor(v) end) })
+g2:CreateSlider({ Name = "Conversas guardadas (máx.)", Range = { 20, 1000 }, Increment = 20, CurrentValue = math.max(20, math.min(1000, NN.Settings.maxMemory)), Flag = "c_mm", Callback = silentAdmin(function(v) NN.Settings.maxMemory = math.floor(v) end) })
+g2:CreateSlider({ Name = "Registros de conhecimento (máx.)", Range = { 50, 2000 }, Increment = 50, CurrentValue = math.max(50, math.min(2000, NN.Settings.maxKnowledge)), Flag = "c_mk", Callback = silentAdmin(function(v) NN.Settings.maxKnowledge = math.floor(v) end) })
+g2:CreateSlider({ Name = "Autosave (segundos)", Range = { 10, 300 }, Increment = 10, CurrentValue = math.max(10, math.min(300, NN.Settings.autosaveSec)), Flag = "c_as", Callback = silentAdmin(function(v) NN.Settings.autosaveSec = math.floor(v) end) })
+g2:CreateSlider({ Name = "Pausa a cada N lotes (desempenho)", Range = { 1, 100 }, Increment = 1, CurrentValue = math.max(1, math.min(100, NN.Settings.yieldEvery)), Flag = "c_ye", Callback = silentAdmin(function(v) NN.Settings.yieldEvery = math.floor(v) end) })
+pcall(function() T:CreateThemeManager({ Name = "Temas", Side = "Right" }) end)
+
+--==============================================================================
+-- 12. Console Administrativo
+--==============================================================================
+T = Window:CreateTab({ Name = "Console", Icon = "terminal" })
+g = T:AddLeftGroupbox({ Name = "Console", Icon = "terminal" })
+g:CreateStatusList({ Name = "Saída", MaxRows = 14, UpdateRate = 1, Update = function()
+	local r, L = {}, HUB.CmdLog
+	for i = math.max(1, #L - 13), #L do r[#r + 1] = row("›", L[i]) end
+	if #r == 0 then r[1] = row("›", "Console administrativo. Use \"Executar comando\" e digite: ajuda") end
+	return r
+end })
+g:CreateButton({ Name = "Executar comando…", Icon = "terminal", Callback = function()
+	ask("Comando", "ex.: status · treinar 30 · set lr 0.05 · ajuda", "", false, function(line)
+		local ok, err = pcall(HUB.Exec, line)
+		if not ok then notify("✖ " .. clip(err, 140)) end
+	end)
+end })
+for _, c in ipairs({ "ajuda", "status", "versoes", "log 10", "erros", "testar", "salvar" }) do
+	g:CreateButton({ Name = "› " .. c, Callback = function() local ok, err = pcall(HUB.Exec, c); if not ok then notify("✖ " .. clip(err, 140)) end end })
+end
+g:CreateButton({ Name = "Limpar tela", Icon = "eraser", Callback = function() HUB.CmdLog = {} end })
+g2 = T:AddRightGroupbox({ Name = "Eventos", Icon = "activity" })
+g2:CreateStatusList({ Name = "Inspeção de eventos", MaxRows = 10, UpdateRate = 1, Update = function() return logRows(nil, 10) end })
+g2:CreateStatusList({ Name = "Relatório de execução", MaxRows = 3, UpdateRate = 2, Update = function()
+	local st = HUB.CmdStats or { ok = 0, err = 0 }
+	return { row("Comandos com sucesso", st.ok), row("Comandos com erro", st.err), row("Seu nível", HUB.role) }
+end })
+
+--==============================================================================
+-- final
+--==============================================================================
+if HIDE_BUILTIN_HUB then pcall(HUB.HideBuiltin) end
+M.ExecutorAdapter.Spawn(function()
+	M.ExecutorAdapter.Wait(1)
+	ready = true
+end)
+shared.NinjAIHubUI = { Window = Window, Library = Library, ask = ask, showText = showText, view3D = view3D, act = act, notify = notify }
+Library:Notify({ Title = HUB_NAME, Content = "Hub carregado. Nível: " .. HUB.role, Type = "Success", Duration = 4 })
